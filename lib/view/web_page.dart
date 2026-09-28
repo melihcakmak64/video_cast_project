@@ -217,7 +217,7 @@ const String watch_page = r'''
 
     ws.onopen = () => setStatus('Bağlandı, video bekleniyor...');
 
-    ws.onmessage = (e) => {
+   ws.onmessage = (e) => {
       let msg;
       try { msg = JSON.parse(e.data); } catch (_) { return; }
 
@@ -226,6 +226,15 @@ const String watch_page = r'''
           baseUrl = msg.url;
           duration = msg.duration || 0;
           loadVideo(0);
+          break;
+        case 'updateDuration':
+          if (msg.duration && msg.duration > 0) {
+            duration = msg.duration;
+            // Eğer arayüzde custom bir slider/süre etiketi güncelliyorsanız fonksiyonunuzu çağırabilirsiniz
+            if (typeof updateProgressBar === 'function') {
+              updateProgressBar();
+            }
+          }
           break;
         case 'play':
           v.play().catch(() => {});

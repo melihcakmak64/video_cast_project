@@ -24,13 +24,13 @@ class VideoCastNotifier extends Notifier {
   VideoCastState build() {
     ref.onDispose(() {
       _server?.close(force: true);
+      FFmpegKit.cancel();
 
       for (final socket in _sockets) {
         try {
           socket.sink.close();
         } catch (_) {}
       }
-
       _sockets.clear();
     });
 
@@ -50,7 +50,6 @@ class VideoCastNotifier extends Notifier {
     } catch (e, st) {
       debugPrint('Server başlatılamadı: $e');
       debugPrint('$st');
-
       state = state.copyWith(isServing: false);
     }
   }
@@ -61,30 +60,28 @@ class VideoCastNotifier extends Notifier {
       includeLoopback: false,
     );
 
-    // Wi-Fi öncelikli arama
+    String? fallbackIp;
+
     for (final interface in interfaces) {
       final name = interface.name.toLowerCase();
-
-      if (name.contains('wlan') ||
+      final isWifi =
+          name.contains('wlan') ||
           name.contains('wifi') ||
-          name.contains('en0')) {
-        for (final address in interface.addresses) {
-          if (!address.isLoopback) {
+          name.contains('en0');
+
+      for (final address in interface.addresses) {
+        if (!address.isLoopback) {
+          if (isWifi) {
             state = state.copyWith(localIp: address.address);
             return;
           }
+          fallbackIp ??= address.address;
         }
       }
     }
 
-    // İlk uygun IPv4 adresi
-    for (final interface in interfaces) {
-      for (final address in interface.addresses) {
-        if (!address.isLoopback) {
-          state = state.copyWith(localIp: address.address);
-          return;
-        }
-      }
+    if (fallbackIp != null) {
+      state = state.copyWith(localIp: fallbackIp);
     }
   }
 
@@ -96,23 +93,14 @@ class VideoCastNotifier extends Notifier {
     final result = await FilePicker.platform.pickFiles(
       type: FileType.video,
       allowMultiple: false,
+      withReadStream: false,
+      withData: false,
     );
 
-    if (result == null) {
-      return;
-    }
+    if (result == null || result.files.single.path == null) return;
 
-    final path = result.files.single.path;
-
-    if (path == null) {
-      return;
-    }
-
+    final path = result.files.single.path!;
     final inputFile = File(path);
-
-    final session = await FFprobeKit.getMediaInformation(inputFile.path);
-    final info = session.getMediaInformation();
-    final totalDuration = double.tryParse(info?.getDuration() ?? '') ?? 0.0;
 
     if (!await inputFile.exists()) {
       debugPrint('Video bulunamadı: $path');
@@ -122,16 +110,35 @@ class VideoCastNotifier extends Notifier {
     state = state.copyWith(
       selectedVideoFile: inputFile,
       currentSeconds: 0.0,
-      totalSeconds: totalDuration,
+      totalSeconds: 0.0,
       isPlaying: true,
     );
 
-    // Önceden remux yapmadan doğrudan oynatıcıyı tetikliyoruz (On-The-Fly)
     _reloadTvPlayer();
+
+    FFprobeKit.getMediaInformation(inputFile.path)
+        .then((session) {
+          final info = session.getMediaInformation();
+          final totalDuration =
+              double.tryParse(info?.getDuration() ?? '') ?? 0.0;
+
+          if (totalDuration > 0) {
+            state = state.copyWith(totalSeconds: totalDuration);
+            _broadcastCommand(
+              jsonEncode({
+                'command': 'updateDuration',
+                'duration': totalDuration,
+              }),
+            );
+          }
+        })
+        .catchError((e) {
+          debugPrint('FFprobe süre alma hatası: $e');
+        });
   }
 
   // ===========================================================================
-  // PLAY / PAUSE
+  // PLAY / PAUSE / SEEK
   // ===========================================================================
 
   void togglePlay() {
@@ -140,15 +147,8 @@ class VideoCastNotifier extends Notifier {
     _broadcastCommand(jsonEncode({'command': newIsPlaying ? 'play' : 'pause'}));
   }
 
-  // ===========================================================================
-  // SEEK
-  // ===========================================================================
-
   void seekTo(double seconds) {
-    if (seconds < 0) {
-      seconds = 0;
-    }
-
+    if (seconds < 0) seconds = 0;
     if (state.totalSeconds > 0 && seconds > state.totalSeconds) {
       seconds = state.totalSeconds;
     }
@@ -156,10 +156,6 @@ class VideoCastNotifier extends Notifier {
     state = state.copyWith(currentSeconds: seconds);
     _broadcastCommand(jsonEncode({'command': 'seek', 'seconds': seconds}));
   }
-
-  // ===========================================================================
-  // PLAYER RELOAD
-  // ===========================================================================
 
   void _reloadTvPlayer() {
     final timestamp = DateTime.now().millisecondsSinceEpoch;
@@ -177,19 +173,14 @@ class VideoCastNotifier extends Notifier {
   // ===========================================================================
 
   void _broadcastCommand(String message) {
-    final deadSockets = [];
-
-    for (final socket in _sockets) {
+    _sockets.removeWhere((socket) {
       try {
         socket.sink.add(message);
+        return false;
       } catch (_) {
-        deadSockets.add(socket);
+        return true;
       }
-    }
-
-    if (deadSockets.isNotEmpty) {
-      _sockets.removeWhere(deadSockets.contains);
-    }
+    });
 
     if (_sockets.isEmpty) {
       state = state.copyWith(isTvConnected: false);
@@ -219,36 +210,21 @@ class VideoCastNotifier extends Notifier {
                 totalSeconds: (data['duration'] as num).toDouble(),
                 isPlaying: !(data['paused'] as bool),
               );
-            }
-
-            if (data['event'] == 'seek') {
-              final seconds = (data['seconds'] as num).toDouble();
-              seekTo(seconds);
+            } else if (data['event'] == 'seek') {
+              seekTo((data['seconds'] as num).toDouble());
             }
           } catch (e) {
             debugPrint('WebSocket mesaj hatası: $e');
           }
         },
-        onDone: () {
-          _sockets.remove(webSocket);
-          if (_sockets.isEmpty) {
-            state = state.copyWith(isTvConnected: false);
-          }
-        },
-        onError: (_) {
-          _sockets.remove(webSocket);
-          if (_sockets.isEmpty) {
-            state = state.copyWith(isTvConnected: false);
-          }
-        },
+        onDone: () => _removeSocket(webSocket),
+        onError: (_) => _removeSocket(webSocket),
         cancelOnError: true,
       );
     });
 
     Future<shelf.Response> handler(shelf.Request request) async {
-      if (request.url.path == 'ws') {
-        return wsHandler(request);
-      }
+      if (request.url.path == 'ws') return wsHandler(request);
 
       if (request.url.path.isEmpty || request.url.path == '/') {
         return shelf.Response.ok(
@@ -267,10 +243,6 @@ class VideoCastNotifier extends Notifier {
       return shelf.Response.notFound('İçerik bulunamadı');
     }
 
-    try {
-      await _server?.close(force: true);
-    } catch (_) {}
-
     final server = await io.serve(handler, InternetAddress.anyIPv4, 8080);
     server.autoCompress = false;
     _server = server;
@@ -279,8 +251,15 @@ class VideoCastNotifier extends Notifier {
     debugPrint('Server: http://${state.localIp}:8080');
   }
 
+  void _removeSocket(WebSocketChannel socket) {
+    _sockets.remove(socket);
+    if (_sockets.isEmpty) {
+      state = state.copyWith(isTvConnected: false);
+    }
+  }
+
   // ===========================================================================
-  // ON-THE-FLY HTTP STREAMING (CANLI DÖNÜŞTÜRME & AKIŞ)
+  // ON-THE-FLY HTTP STREAMING
   // ===========================================================================
 
   Future<shelf.Response> _handleVideoRequest(shelf.Request request) async {
@@ -300,19 +279,37 @@ class VideoCastNotifier extends Notifier {
       }
 
       final command = [
-        '-ss', startSeconds.toString(),
-        '-i', '"${inputFile.path}"', // boşluklu yollar için tırnak
-        '-map', '0:v:0',
-        '-map', '0:a:0?',
-        '-c:v', 'copy',
-        '-c:a', 'aac',
-        '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
-        '-f', 'mp4',
+        if (startSeconds > 0) ...[
+          '-ss',
+          startSeconds.toString(),
+          '-noaccurate_seek',
+        ],
+        '-i',
+        inputFile.path,
+        '-map',
+        '0:v:0',
+        '-map',
+        '0:a:0?',
+        '-c:v',
+        'copy',
+        '-c:a',
+        'aac',
+        '-ac',
+        '2',
+        '-copyts',
+        '-start_at_zero',
+        '-avoid_negative_ts',
+        'make_zero',
+        '-max_muxing_queue_size',
+        '2048',
+        '-movflags',
+        'frag_keyframe+empty_moov+default_base_moof',
+        '-f',
+        'mp4',
         '-y',
         pipePath,
       ].join(' ');
 
-      // Beklemeden arka planda çalıştır
       FFmpegKit.executeAsync(command);
 
       final stream = File(pipePath).openRead();
