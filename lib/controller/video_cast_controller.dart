@@ -22,6 +22,7 @@ class VideoCastNotifier extends Notifier {
 
   @override
   VideoCastState build() {
+    FilePicker.platform.clearTemporaryFiles();
     ref.onDispose(() {
       _server?.close(force: true);
       FFmpegKit.cancel();
@@ -90,6 +91,7 @@ class VideoCastNotifier extends Notifier {
   // ===========================================================================
 
   Future pickVideo() async {
+    final oldFile = state.selectedVideoFile;
     final result = await FilePicker.platform.pickFiles(
       type: FileType.video,
       allowMultiple: false,
@@ -100,6 +102,15 @@ class VideoCastNotifier extends Notifier {
     if (result == null || result.files.single.path == null) return;
 
     final path = result.files.single.path!;
+    if (oldFile != null && oldFile.path != path) {
+      await FFmpegKit.cancel();
+      await Future.delayed(const Duration(milliseconds: 300));
+      try {
+        await oldFile.delete();
+      } catch (e) {
+        debugPrint('Silinemedi: $e');
+      }
+    }
     final inputFile = File(path);
 
     if (!await inputFile.exists()) {
